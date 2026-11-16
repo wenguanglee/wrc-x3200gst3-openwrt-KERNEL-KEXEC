@@ -1,31 +1,59 @@
 
-name: WRC-X3200GST3 OpenWrt KEXEC Build
+name: WRC-X3200GST3 OpenWrt 25.12.6 KEXEC
 
-on:
+"on":
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - 'config.seed'
-      - 'scripts/**'
-      - '.github/workflows/**'
 
 permissions:
   contents: read
+
+env:
+  OPENWRT_TAG: v25.12.6
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
-    steps:
-      - name: Checkout configuration
-        uses: actions/checkout@v4
+    defaults:
+      run:
+        shell: bash
 
+    steps:
+      # 1. 获取官方固定版本源码
+      - name: Checkout OpenWrt 25.12.6
+        uses: actions/checkout@v6
+        with:
+          repository: openwrt/openwrt
+          ref: ${{ env.OPENWRT_TAG }}
+          path: openwrt
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 2. 清理 GitHub Runner 空间
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          for sdk in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc
+          do
+            if [ -d "$sdk" ]; then
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+
+          df -h .
+
+      # 3. 安装 OpenWrt 编译依赖
       - name: Install build dependencies
         run: |
+          set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -39,32 +67,267 @@ jobs:
             git \
             libncurses-dev \
             libssl-dev \
+            libelf-dev \
+            python3 \
             python3-setuptools \
             rsync \
+            swig \
             unzip \
             zlib1g-dev \
             file \
             wget \
             curl \
-            subversion \
-            swig \
-            time \
-            xsltproc \
-            libelf-dev \
-            libpython3-dev
+            cpio \
+            xz-utils \
+            zstd \
+            bzip2 \
+            ca-certificates
 
-      - name: Build OpenWrt
+          df -h .
+
+      # 4. 只更新 LuCI feed，不全量安装 feeds
+      - name: Prepare feeds
         run: |
-          chmod +x scripts/build.sh
-          ./scripts/build.sh
-        env:
-          OPENWRT_REF: v25.12.6
-          JOBS: 2
+          set -euo pipefail
 
-      - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
+          cd openwrt
+
+          ./scripts/feeds update luci \
+            2>&1 | tee ../feeds-update.log
+
+          # 只安装需要的 LuCI 软件包
+          ./scripts/feeds install \
+            luci \
+            luci-base \
+            luci-app-package-manager \
+            luci-i18n-base-zh-cn \
+            2>&1 | tee ../feeds-install.log
+
+          # 确认没有安装 Weechat
+          if [ -e package/feeds/packages/luci-app-weechat ]; then
+            echo "Unexpected Weechat package"
+            exit 1
+          fi
+
+      # 5. 默认分区配置 + KEXEC
+      - name: Configure WRC-X3200GST3
+        run: |
+          set -euo pipefail
+
+          cd openwrt
+
+          # 不修改 DTS
+          # 不修改 IMAGE_SIZE
+          # 使用官方默认分区
+
+          cat > .config <<'CONFIG'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_mt7622=y
+          CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y
+
+          # 默认 SquashFS 固件
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+
+          # 同时生成 RAM 启动镜像
+          CONFIG_TARGET_ROOTFS_INITRAMFS=y
+
+          # OpenWrt 25.12 APK
+          CONFIG_USE_APK=y
+
+          # ARM64 KEXEC 内核支持
+          CONFIG_KERNEL_KEXEC=y
+
+          # KEXEC 用户空间程序
+          CONFIG_PACKAGE_kexec=y
+
+          # LuCI 管理界面
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+
+          # UBI 工具
+          CONFIG_PACKAGE_ubi-utils=y
+
+          # U-Boot 环境工具
+          CONFIG_PACKAGE_uboot-envtools=y
+
+          # CA 证书
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG
+          
+          # 生成最终配置
+          make defconfig 2>&1 | tee ../defconfig.log
+
+          echo "===== Verify target ====="
+
+          grep -qx \
+            'CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y' \
+            .config
+
+          echo "===== Verify KEXEC ====="
+
+          grep -qx 'CONFIG_KERNEL_KEXEC=y' .config
+          grep -qx 'CONFIG_PACKAGE_kexec=y' .config
+
+          echo "===== Verify initramfs ====="
+
+          grep -qx 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' .config
+
+          echo "===== Verify SquashFS ====="
+
+          grep -qx 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' .config
+
+          echo "===== Final configuration ====="
+
+          grep -E \
+            'CONFIG_KERNEL_KEXEC|CONFIG_PACKAGE_kexec|CONFIG_TARGET_ROOTFS_INITRAMFS|CONFIG_TARGET_ROOTFS_SQUASHFS' \
+            .config
+
+      # 6. 下载编译源码
+      - name: Download sources
+        run: |
+          set -euo pipefail
+
+          cd openwrt
+
+          make download -j4 \
+            2>&1 | tee ../download.log
+
+      # 7. 编译固件
+      - name: Compile firmware
+        run: |
+          set -euo pipefail
+
+          cd openwrt
+
+          (
+            make -j2 || make -j1 V=s
+          ) 2>&1 | tee ../build.log
+
+      # 8. 检查固件
+      - name: Verify firmware
+        run: |
+          set -euo pipefail
+
+          cd openwrt
+
+          DIR="bin/targets/mediatek/mt7622"
+
+          echo "===== Firmware directory ====="
+          ls -lh "$DIR"
+
+          mapfile -t SYSUP < <(
+            find "$DIR" -maxdepth 1 -type f \
+              -name '*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'
+          )
+
+          mapfile -t RAM < <(
+            find "$DIR" -maxdepth 1 -type f \
+              -name '*elecom_wrc-x3200gst3-initramfs-kernel.bin'
+          )
+
+          if [ "${#SYSUP[@]}" -ne 1 ]; then
+            echo "ERROR: sysupgrade image missing or duplicated"
+            exit 1
+          fi
+
+          if [ "${#RAM[@]}" -ne 1 ]; then
+            echo "ERROR: initramfs image missing or duplicated"
+            exit 1
+          fi
+
+          echo "===== KEXEC configuration ====="
+
+          grep -qx 'CONFIG_KERNEL_KEXEC=y' .config
+          grep -qx 'CONFIG_PACKAGE_kexec=y' .config
+
+          echo "===== Find kexec package ====="
+
+          find bin/packages -type f -name 'kexec-*.apk' \
+            -print
+
+          echo "===== Check original DTS unchanged ====="
+
+          git diff --exit-code HEAD -- \
+            target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
+            target/linux/mediatek/image/mt7622.mk
+
+          echo "===== Image sizes ====="
+
+          ls -lh "${SYSUP[0]}" "${RAM[0]}"
+
+          # 保存构建产物
+          mkdir -p ../artifacts
+
+          cp "${SYSUP[0]}" ../artifacts/
+          cp "${RAM[0]}" ../artifacts/
+
+          cp .config ../artifacts/full.config
+
+          cp feeds.conf.default \
+            ../artifacts/feeds.conf.default
+
+          ./scripts/diffconfig.sh \
+            > ../artifacts/build.config
+
+          git rev-parse HEAD \
+            > ../artifacts/source-commit.txt
+
+          cp "$DIR"/*elecom_wrc-x3200gst3*.manifest \
+            ../artifacts/ 2>/dev/null || true
+
+          cat > ../artifacts/READ-BEFORE-FLASH.txt <<'NOTICE'
+          ELECOM WRC-X3200GST3
+          OpenWrt 25.12.6
+          
+          BUILD OUTPUT ONLY.
+
+          Original default partition layout retained.
+          No DTS partition modifications.
+          No automatic flashing.
+          No automatic NAND erase.
+          No automatic UBI resize.
+
+          KEXEC kernel configuration enabled.
+          KEXEC userspace package requested.
+
+          Initramfs image is for RAM boot.
+          Initramfs image is NOT a sysupgrade image.
+
+          This firmware is NOT the 109 MiB migration firmware.
+          Do not use it to assume that partition migration is complete.
+
+          KEXEC availability does not prove that RAM boot
+          or no-serial migration is reliable on this device.
+          NOTICE
+
+          cd ../artifacts
+
+          sha256sum *.bin > SHA256SUMS
+
+          echo "===== Final artifacts ====="
+          ls -lh
+
+      # 9. 上传固件
+      - name: Upload firmware
+        uses: actions/upload-artifact@v6
         with:
-          name: WRC-X3200GST3-OpenWrt-25.12.6-KEXEC
-          path: out/
+          name: WRC-X3200GST3-25.12.6-KEXEC-default
+          path: artifacts/
           if-no-files-found: error
+          retention-days: 30
+
+      # 10. 即使失败也上传日志
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: WRC-X3200GST3-build-logs
+          path: |
+            feeds-update.log
+            feeds-install.log
+            defconfig.log
+            download.log
+            build.log
+          if-no-files-found: warn
           retention-days: 30
