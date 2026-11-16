@@ -31,8 +31,15 @@ fi
 cd "$OPENWRT_DIR"
 
 # 2. Update feeds
-./scripts/feeds update -a
-./scripts/feeds install -a
+
+# 更新官方 feeds
+./scripts/feeds update base packages luci routing
+
+# 只安装必要 feeds
+./scripts/feeds install -a -p base
+./scripts/feeds install -a -p packages
+./scripts/feeds install -a -p luci
+./scripts/feeds install -a -p routing
 
 # 3. Load build configuration
 cp "$ROOT_DIR/config.seed" .config
