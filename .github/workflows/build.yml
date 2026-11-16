@@ -207,6 +207,26 @@ jobs:
             make -j2 || make -j1 V=s
           ) 2>&1 | tee ../build.log
 
+      - name: Build KEXEC package
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          echo "===== Check KEXEC package source ====="
+          test -f package/boot/kexec-tools/Makefile
+
+          echo "===== Build KEXEC ====="
+          make package/boot/kexec-tools/compile V=s -j2
+
+          echo "===== Find APK ====="
+          find bin/packages -type f -iname '*kexec*.apk'
+
+          mkdir -p ../artifacts/kexec
+          find bin/packages -type f -iname '*kexec*.apk' \
+            -exec cp -v {} ../artifacts/kexec/ \;
+
+          test -n "$(find ../artifacts/kexec -type f -name '*.apk' -print -quit)"
+
       # 8. 检查固件
       - name: Verify firmware
         run: |
