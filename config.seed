@@ -1,0 +1,17 @@
+
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_mt7622=y
+CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y
+
+# 保持默认 SquashFS
+CONFIG_TARGET_ROOTFS_SQUASHFS=y
+
+# 同时生成 initramfs
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+
+# Linux KEXEC 支持
+CONFIG_KERNEL_KEXEC=y
+
+# 安装 kexec 工具
+CONFIG_PACKAGE_kexec=y
+CONFIG_PACKAGE_kexec-tools=y
