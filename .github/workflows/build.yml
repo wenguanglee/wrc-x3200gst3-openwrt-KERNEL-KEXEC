@@ -89,26 +89,21 @@ jobs:
       - name: Prepare feeds
         run: |
           set -euo pipefail
-
           cd openwrt
 
-          ./scripts/feeds update luci \
-            2>&1 | tee ../feeds-update.log
+          # 更新全部官方 feeds
+          ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
 
-          # 只安装需要的 LuCI 软件包
-          ./scripts/feeds install \
-            luci \
-            luci-base \
-            luci-app-package-manager \
-            luci-i18n-base-zh-cn \
-            2>&1 | tee ../feeds-install.log
+          # 安装完整依赖
+          ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
 
-          # 确认没有安装 Weechat
-          if [ -e package/feeds/packages/luci-app-weechat ]; then
-            echo "Unexpected Weechat package"
-            exit 1
-          fi
+          # 删除存在循环依赖的 LuCI Weechat 插件
+          rm -rf package/feeds/luci/luci-app-weechat
 
+          # 确认已排除
+          test ! -e package/feeds/luci/luci-app-weechat
+
+          echo "Feeds prepared successfully"
       # 5. 默认分区配置 + KEXEC
       - name: Configure WRC-X3200GST3
         run: |
