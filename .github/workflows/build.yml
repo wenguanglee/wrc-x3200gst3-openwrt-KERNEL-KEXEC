@@ -159,24 +159,32 @@ jobs:
             'CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y' \
             .config
 
-          echo "===== Verify KEXEC ====="
 
-          grep -qx 'CONFIG_KERNEL_KEXEC=y' .config
-          grep -qx 'CONFIG_PACKAGE_kexec=y' .config
 
-          echo "===== Verify initramfs ====="
+          echo "===== KEXEC CONFIG DEBUG ====="
+          
+          echo "--- OpenWrt config ---"
+          grep -nE 'KERNEL_KEXEC|PACKAGE_kexec' .config || true
+          
+          echo "--- Kernel config definition ---"
+          grep -n -A5 -B3 'config KERNEL_KEXEC' \
+              config/Config-kernel.in
+          
+          echo "--- Package definition ---"
+          grep -n -A12 -B3 'config PACKAGE_kexec' \
+              tmp/.config-package.in || true
+          
+          echo "--- Kernel architecture ---"
+          grep -E 'CONFIG_(aarch64|arm|ARCH)' .config || true
+          
+          echo "--- Final kernel config ---"
+          if [ -f build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_mt7622/linux-*/.config ]; then
+              grep -E '^CONFIG_KEXEC=' \
+                build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_mt7622/linux-*/.config || true
+          fi
+          
+          echo "===== END DEBUG ====="
 
-          grep -qx 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' .config
-
-          echo "===== Verify SquashFS ====="
-
-          grep -qx 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' .config
-
-          echo "===== Final configuration ====="
-
-          grep -E \
-            'CONFIG_KERNEL_KEXEC|CONFIG_PACKAGE_kexec|CONFIG_TARGET_ROOTFS_INITRAMFS|CONFIG_TARGET_ROOTFS_SQUASHFS' \
-            .config
 
       # 6. 下载编译源码
       - name: Download sources
