@@ -77,7 +77,8 @@ jobs:
           # ARM64 ARCH_SUPPORTS_KEXEC depends on PM_SLEEP_SMP in Linux 6.12.
           # SUSPEND supplies PM_SLEEP; PM_SLEEP_SMP selects CPU hotplug.
           # This enables the infrastructure, NOT an automatic suspend policy.
-          for key in ('SUSPEND', 'KEXEC', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+          # for key in ('SUSPEND', 'KEXEC', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+          for key in ('SUSPEND', 'FW_CACHE', 'KEXEC', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
               pattern = rf'^(?:CONFIG_{key}=.*|# CONFIG_{key} is not set)\n?'
               s = re.sub(pattern, '', s, flags=re.M)
               s = s.rstrip() + f'\nCONFIG_{key}=y\n'
