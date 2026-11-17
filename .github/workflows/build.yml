@@ -1,11 +1,17 @@
-
-name: WRC-X3200GST3 OpenWrt 25.12.6 KEXEC
+# Original-layout KEXEC bridge build; NOT a partition migration installer.
+# Only this file is required: .github/workflows/build.yml
+# No router is contacted. No flash/erase/kexec-execute commands are run.
+name: WRC-X3200GST3 25.12.6 KEXEC default - fixed
 
 "on":
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: wrc-kexec-default-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   OPENWRT_TAG: v25.12.6
@@ -14,14 +20,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-
     defaults:
       run:
         shell: bash
-
     steps:
-      # 1. 获取官方固定版本源码
-      - name: Checkout OpenWrt 25.12.6
+      - name: Checkout fixed official OpenWrt source
         uses: actions/checkout@v6
         with:
           repository: openwrt/openwrt
@@ -29,340 +32,397 @@ jobs:
           path: openwrt
           fetch-depth: 1
           persist-credentials: false
-
-      # 2. 清理 GitHub Runner 空间
-      - name: Prepare build environment
+      - name: Prepare ephemeral runner and install dependencies
         run: |
           set -euo pipefail
-
-          for sdk in \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc
-          do
-            if [ -d "$sdk" ]; then
-              sudo rm -rf -- "$sdk"
-            fi
+          # Only disposable GitHub runner SDKs, never router data.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
+            if [ -d "$sdk" ]; then sudo rm -rf -- "$sdk"; fi
           done
-
-          df -h .
-
-      # 3. 安装 OpenWrt 编译依赖
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
-            build-essential \
-            clang \
-            flex \
-            bison \
-            g++ \
-            gawk \
-            gcc-multilib \
-            g++-multilib \
-            gettext \
-            git \
-            libncurses-dev \
-            libssl-dev \
-            libelf-dev \
-            python3 \
-            python3-setuptools \
-            rsync \
-            swig \
-            unzip \
-            zlib1g-dev \
-            file \
-            wget \
-            curl \
-            cpio \
-            xz-utils \
-            zstd \
-            bzip2 \
-            ca-certificates
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev libelf-dev python3 \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget curl cpio \
+            xz-utils zstd bzip2 ca-certificates squashfs-tools binutils
+          mkdir -p diagnostics
+          df -h . | tee diagnostics/disk-before.txt
 
-          df -h .
-
-      # 4. 只更新 LuCI feed，不全量安装 feeds
-      - name: Prepare feeds
+      - name: Enable ARM64 kexec without changing flash layout
         run: |
           set -euo pipefail
           cd openwrt
+          test "$(git describe --tags --exact-match HEAD)" = "$OPENWRT_TAG"
+          python3 - <<'PY_PATCH'
 
-          # 更新全部官方 feeds
-          ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
+          from pathlib import Path
+          import re
 
-          # 安装完整依赖
-          ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
+          # The release's userspace recipe omits aarch64; upstream kexec-tools
+          # 2.0.28 contains an ARM64 loader. This is a local enablement, not a
+          # claim that this board's kexec reboot has been validated.
+          p = Path('package/boot/kexec-tools/Makefile')
+          s = p.read_text()
+          old = '@(armeb||arm||i386||x86_64||powerpc64||mipsel||mips)'
+          new = '@(armeb||arm||aarch64||i386||x86_64||powerpc64||mipsel||mips)'
+          if s.count(old) != 1:
+              raise SystemExit('Unexpected kexec recipe: refusing an unreviewed patch')
+          recipe = s.replace(old, new, 1)
+          recipe_path = p
 
-          # 删除存在循环依赖的 LuCI Weechat 插件
-          rm -rf package/feeds/luci/luci-app-weechat
+          # Actual kernel-fragment options; do not invent nonexistent OpenWrt
+          # frontend CONFIG_KERNEL_IKCONFIG symbols. Preserve the flash layout.
+          p = Path('target/linux/mediatek/mt7622/config-6.12')
+          s = p.read_text()
+          # ARM64 ARCH_SUPPORTS_KEXEC depends on PM_SLEEP_SMP in Linux 6.12.
+          # SUSPEND supplies PM_SLEEP; PM_SLEEP_SMP selects CPU hotplug.
+          # This enables the infrastructure, NOT an automatic suspend policy.
+          for key in ('SUSPEND', 'KEXEC', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+              pattern = rf'^(?:CONFIG_{key}=.*|# CONFIG_{key} is not set)\n?'
+              s = re.sub(pattern, '', s, flags=re.M)
+              s = s.rstrip() + f'\nCONFIG_{key}=y\n'
+          for key in ('PM_AUTOSLEEP', 'PM_USERSPACE_AUTOSLEEP'):
+              pattern = rf'^(?:CONFIG_{key}=.*|# CONFIG_{key} is not set)\n?'
+              s = re.sub(pattern, '', s, flags=re.M)
+              s = s.rstrip() + f'\n# CONFIG_{key} is not set\n'
+          # Write only after both original files could be read and edited.
+          recipe_path.write_text(recipe)
+          p.write_text(s)
+          print('Enabled aarch64 kexec recipe and kernel diagnostics; no DTS changes.')
 
-          # 确认已排除
+          PY_PATCH
+          git diff --check
+          git diff --exit-code HEAD -- \
+            target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
+            target/linux/mediatek/image/mt7622.mk
+          git diff > ../diagnostics/source-changes.patch
+
+      - name: Prepare pinned feeds and exclude the known Kconfig cycle
+        run: |
+          set -euo pipefail
+          cd openwrt
+          # Full feed definitions are indexed; they are NOT all included in firmware.
+          ./scripts/feeds update -a 2>&1 | tee ../diagnostics/feeds-update.log
+          ./scripts/feeds install -a 2>&1 | tee ../diagnostics/feeds-install.log
+          ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../diagnostics/feeds-exclude.log
           test ! -e package/feeds/luci/luci-app-weechat
+          test ! -L package/feeds/luci/luci-app-weechat
+          rm -f tmp/.packageinfo tmp/.config-package.in
 
-          echo "Feeds prepared successfully"
-      # 5. 默认分区配置 + KEXEC
-      - name: Configure WRC-X3200GST3
+      - name: Configure original-layout firmware with built-in kexec
         run: |
           set -euo pipefail
-
           cd openwrt
-
-          # 不修改 DTS
-          # 不修改 IMAGE_SIZE
-          # 使用官方默认分区
-
           cat > .config <<'CONFIG'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_mt7622=y
           CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y
-
-          # 默认 SquashFS 固件
           CONFIG_TARGET_ROOTFS_SQUASHFS=y
-
-          # 同时生成 RAM 启动镜像
           CONFIG_TARGET_ROOTFS_INITRAMFS=y
-
-          # OpenWrt 25.12 APK
+          # CONFIG_TARGET_ROOTFS_EROFS is not set
           CONFIG_USE_APK=y
-
-          # ARM64 KEXEC 内核支持
           CONFIG_KERNEL_KEXEC=y
-
-          # KEXEC 用户空间程序
           CONFIG_PACKAGE_kexec=y
-
-          # LuCI 管理界面
+          CONFIG_KEXEC_ZLIB=y
+          # CONFIG_KEXEC_LZMA is not set
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_LUCI_LANG_zh_Hans=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-
-          # UBI 工具
           CONFIG_PACKAGE_ubi-utils=y
-
-          # U-Boot 环境工具
           CONFIG_PACKAGE_uboot-envtools=y
-
-          # CA 证书
           CONFIG_PACKAGE_ca-bundle=y
+          # CONFIG_PACKAGE_python3 is not set
+          # CONFIG_PACKAGE_python3-pip is not set
           CONFIG
-          
-          # 生成最终配置
-          make defconfig 2>&1 | tee ../defconfig.log
+          cp .config ../diagnostics/requested.config
+          make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../diagnostics/defconfig.log
+          cp .config ../diagnostics/full.config
+          {
+            for symbol in \
+              CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
+              CONFIG_TARGET_ROOTFS_SQUASHFS CONFIG_TARGET_ROOTFS_INITRAMFS \
+              CONFIG_USE_APK CONFIG_KERNEL_KEXEC CONFIG_PACKAGE_kexec \
+              CONFIG_PACKAGE_luci CONFIG_LUCI_LANG_zh_Hans \
+              CONFIG_PACKAGE_luci-i18n-base-zh-cn CONFIG_PACKAGE_luci-app-package-manager \
+              CONFIG_PACKAGE_ubi-utils CONFIG_PACKAGE_uboot-envtools CONFIG_PACKAGE_ca-bundle; do
+              if ! grep -qx "${symbol}=y" .config; then
+                echo "::error::Required option missing after defconfig: ${symbol}=y"
+                exit 1
+              fi
+              echo "OK: ${symbol}=y"
+            done
+            if grep -E '^CONFIG_PACKAGE_((python[0-9]*|libpython|micropython)[^=]*|pip|pip3)=(y|m)$' .config; then
+              echo '::error::Unexpected target Python package'
+              exit 1
+            fi
+            echo 'Required configuration checks passed.'
+          } 2>&1 | tee ../diagnostics/config-check.log
 
-          echo "===== Verify target ====="
-
-          grep -qx \
-            'CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y' \
-            .config
-
-
-
-          echo "===== KEXEC CONFIG DEBUG ====="
-          
-          echo "--- OpenWrt config ---"
-          grep -nE 'KERNEL_KEXEC|PACKAGE_kexec' .config || true
-          
-          echo "--- Kernel config definition ---"
-          grep -n -A5 -B3 'config KERNEL_KEXEC' \
-              config/Config-kernel.in
-          
-          echo "--- Package definition ---"
-          grep -n -A12 -B3 'config PACKAGE_kexec' \
-              tmp/.config-package.in || true
-          
-          echo "--- Kernel architecture ---"
-          grep -E 'CONFIG_(aarch64|arm|ARCH)' .config || true
-          
-          echo "--- Final kernel config ---"
-          if [ -f build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_mt7622/linux-*/.config ]; then
-              grep -E '^CONFIG_KEXEC=' \
-                build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_mt7622/linux-*/.config || true
-          fi
-          
-          echo "===== END DEBUG ====="
-
-
-      # 6. 下载编译源码
       - name: Download sources
         run: |
           set -euo pipefail
-
           cd openwrt
+          make download -j4 2>&1 | tee ../diagnostics/download.log
 
-          make download -j4 \
-            2>&1 | tee ../download.log
-
-      # 7. 编译固件
-      - name: Compile firmware
-        run: |
-          set -euo pipefail
-
-          cd openwrt
-
-          (
-            make -j2 || make -j1 V=s
-          ) 2>&1 | tee ../build.log
-
-      - name: Build KEXEC package
+      - name: Compile firmware and selected kexec package together
         run: |
           set -euo pipefail
           cd openwrt
+          (make -j2 || make -j1 V=s) 2>&1 | tee ../diagnostics/build.log
+          # Do not build kexec only AFTER the firmware has already been packaged.
 
-          echo "===== Check KEXEC package source ====="
-          test -f package/boot/kexec-tools/Makefile
-
-          echo "===== Build KEXEC ====="
-          make package/boot/kexec-tools/compile V=s -j2
-
-          echo "===== Find APK ====="
-          find bin/packages -type f -iname '*kexec*.apk'
-
-          mkdir -p ../artifacts/kexec
-          find bin/packages -type f -iname '*kexec*.apk' \
-            -exec cp -v {} ../artifacts/kexec/ \;
-
-          test -n "$(find ../artifacts/kexec -type f -name '*.apk' -print -quit)"
-
-      # 8. 检查固件
-      - name: Verify firmware
+      - name: Verify final kernel binary userspace and default partitions
         run: |
           set -euo pipefail
-
           cd openwrt
-
-          DIR="bin/targets/mediatek/mt7622"
-
-          echo "===== Firmware directory ====="
-          ls -lh "$DIR"
-
-          mapfile -t SYSUP < <(
-            find "$DIR" -maxdepth 1 -type f \
-              -name '*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'
-          )
-
-          mapfile -t RAM < <(
-            find "$DIR" -maxdepth 1 -type f \
-              -name '*elecom_wrc-x3200gst3-initramfs-kernel.bin'
-          )
-
-          if [ "${#SYSUP[@]}" -ne 1 ]; then
-            echo "ERROR: sysupgrade image missing or duplicated"
-            exit 1
-          fi
-
-          if [ "${#RAM[@]}" -ne 1 ]; then
-            echo "ERROR: initramfs image missing or duplicated"
-            exit 1
-          fi
-
-          echo "===== KEXEC configuration diagnostics ====="
-          
-          grep -nE 'KEXEC|kexec' .config || true
-          
-          echo "===== Kernel configuration ====="
-          
-          grep -n '^CONFIG_KEXEC=' \
-            build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_mt7622/linux-*/.config \
-            2>/dev/null || true
-          
-          echo "===== KEXEC APK package ====="
-          
-          find bin/packages -type f -iname '*kexec*.apk' -print || true
-
-
-          
-
-          echo "===== Find kexec package ====="
-
-          find bin/packages -type f -name 'kexec-*.apk' \
-            -print
-
-          echo "===== Check original DTS unchanged ====="
-
           git diff --exit-code HEAD -- \
             target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
             target/linux/mediatek/image/mt7622.mk
+          python3 - <<'PY_VERIFY' 2>&1 | tee ../diagnostics/verify.log
 
-          echo "===== Image sizes ====="
+          from pathlib import Path
+          import gzip
+          import hashlib
+          import lzma
+          import os
+          import re
+          import shutil
+          import stat
+          import struct
+          import subprocess
+          import tarfile
+          import tempfile
 
-          ls -lh "${SYSUP[0]}" "${RAM[0]}"
+          out = Path('../artifacts')
+          out.mkdir(exist_ok=True)
+          diag = Path('../diagnostics')
 
-          # 保存构建产物
-          mkdir -p ../artifacts
+          def need(condition, message):
+              if not condition:
+                  raise SystemExit('ERROR: ' + message)
 
-          cp "${SYSUP[0]}" ../artifacts/
-          cp "${RAM[0]}" ../artifacts/
+          def one(items, description):
+              items = list(items)
+              need(len(items) == 1, f'{description}: expected exactly one, found {len(items)}')
+              return items[0]
 
-          cp .config ../artifacts/full.config
+          def required_config(text, title):
+              values = set(text.splitlines())
+              for key in ('ARM64', 'SUSPEND', 'PM_SLEEP_SMP', 'ARCH_SUPPORTS_KEXEC',
+                          'KEXEC', 'KEXEC_CORE', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+                  need(f'CONFIG_{key}=y' in values, f'{title}: CONFIG_{key}=y is missing')
+              need('CONFIG_PM_AUTOSLEEP=y' not in values, f'{title}: automatic sleep must stay disabled')
+              print(f'OK: {title}: ARM64 + KEXEC + KEXEC_CORE + runtime config enabled')
 
-          cp feeds.conf.default \
-            ../artifacts/feeds.conf.default
+          kconfig = one(Path('build_dir').glob(
+              'target-*/linux-mediatek_mt7622/linux-*/.config'), 'actual Linux .config')
+          required_config(kconfig.read_text(), 'actual Linux .config')
+          shutil.copy2(kconfig, out / 'kernel-build.config')
+          shutil.copy2(kconfig, diag / 'kernel-build.config')
+          # Check generated headers too, not only the requested frontend configuration.
+          auto = kconfig.parent / 'include/generated/autoconf.h'
+          need(auto.is_file(), 'generated Linux autoconf.h is missing')
+          need('#define CONFIG_KEXEC 1' in auto.read_text(), 'KEXEC absent from compiled kernel headers')
 
-          ./scripts/diffconfig.sh \
-            > ../artifacts/build.config
+          # Read embedded FIT/DTB properties. External data and overlays are deliberately
+          # rejected rather than guessed; this board uses inline data in this release.
+          def fdt(blob):
+              need(len(blob) >= 40, 'truncated FDT header')
+              magic, total, off, strings_off, _, version, _, _, string_size, size = struct.unpack_from('>10I', blob)
+              need(magic == 0xd00dfeed and 17 <= version and total <= len(blob), 'invalid FDT header')
+              end = off + size
+              need(40 <= off <= end <= total and strings_off + string_size <= total, 'invalid FDT bounds')
+              strings = blob[strings_off:strings_off + string_size]
+              stack, props = [], {}
+              while off + 4 <= end:
+                  token = struct.unpack_from('>I', blob, off)[0]
+                  off += 4
+                  if token == 1:
+                      stop = blob.index(b'\0', off, end)
+                      stack.append(blob[off:stop].decode('ascii'))
+                      off = (stop + 4) & ~3
+                  elif token == 2:
+                      need(bool(stack), 'invalid FDT nesting')
+                      stack.pop()
+                  elif token == 3:
+                      need(off + 8 <= end and bool(stack), 'truncated FDT property')
+                      length, nameoff = struct.unpack_from('>II', blob, off)
+                      off += 8
+                      need(off + length <= end and nameoff < len(strings), 'invalid FDT property')
+                      name = strings[nameoff:strings.index(b'\0', nameoff)].decode('ascii')
+                      path = '/' + '/'.join(v for v in stack if v)
+                      need((path, name) not in props, 'duplicate FDT property')
+                      props[path, name] = blob[off:off + length]
+                      off = (off + length + 3) & ~3
+                  elif token == 4:
+                      pass
+                  elif token == 9:
+                      need(not stack, 'unclosed FDT node')
+                      return props
+                  else:
+                      raise SystemExit(f'ERROR: unexpected FDT token {token}')
+              raise SystemExit('ERROR: missing FDT end token')
 
-          git rev-parse HEAD \
-            > ../artifacts/source-commit.txt
+          def string(value):
+              return value.rstrip(b'\0').decode('ascii')
 
-          cp "$DIR"/*elecom_wrc-x3200gst3*.manifest \
-            ../artifacts/ 2>/dev/null || true
+          expected = {
+              'Preloader': (0x0, 0x80000), 'ATF': (0x80000, 0x40000),
+              'u-boot': (0xc0000, 0x80000), 'u-boot-env': (0x140000, 0x80000),
+              'factory': (0x1c0000, 0x100000), 'kernel': (0x2c0000, 0x600000),
+              'ubi': (0x8c0000, 0x1300000), 'tm_pattern': (0x1bc0000, 0x500000),
+              'tm_key': (0x20c0000, 0x100000), 'user_data': (0x21c0000, 0xf00000),
+              # Preserve the upstream DTS value; the driver truncates its visible end.
+              'reserved': (0x30c0000, 0x4f40000),
+          }
 
+          def check_fit(blob, title, work):
+              fit = fdt(blob)
+              cfg = '/configurations/' + string(fit['/configurations', 'default'])
+              dt_node = '/images/' + string(fit[cfg, 'fdt'])
+              props = fdt(fit[dt_node, 'data'])
+              need(b'elecom,wrc-x3200gst3\0' in props['/', 'compatible'], 'wrong board DTB')
+              actual = {}
+              for (path, name), value in props.items():
+                  if name == 'label' and '/partitions/partition@' in path:
+                      label = string(value)
+                      need(label not in actual, 'duplicate partition label')
+                      actual[label] = struct.unpack('>II', props[path, 'reg'])
+              need(actual == expected, f'{title}: NOT the original 19 MiB UBI layout: {actual}')
+              bmt = [v for (p, n), v in props.items() if n == 'mediatek,bmt-remap-range']
+              need(bmt == [struct.pack('>4I', 0, 0x8c0000, 0x1bc0000, 0x30c0000)], 'BMT mapping changed')
+              print(f'OK: {title}: original 11 partitions; kernel 6 MiB; UBI 19 MiB')
+
+              knode = '/images/' + string(fit[cfg, 'kernel'])
+              raw = fit[knode, 'data']
+              comp = string(fit.get((knode, 'compression'), b'none\0'))
+              if comp == 'lzma':
+                  raw = lzma.decompress(raw, format=lzma.FORMAT_ALONE)
+              elif comp == 'gzip':
+                  raw = gzip.decompress(raw)
+              else:
+                  need(comp == 'none', f'unhandled kernel compression: {comp}')
+              need(len(raw) >= 64 and raw[56:60] == b'ARM\x64', 'not an ARM64 Image')
+              image = work / (title + '-Image')
+              image.write_bytes(raw)
+              result = subprocess.run(
+                  ['sh', str(kconfig.parent / 'scripts/extract-ikconfig'), str(image)],
+                  check=True, capture_output=True, text=True)
+              required_config(result.stdout, f'{title} embedded kernel config')
+              (out / (title + '-kernel.config')).write_text(result.stdout)
+              return fit, cfg
+
+          directory = Path('bin/targets/mediatek/mt7622')
+          sysup = one(directory.glob('*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'), 'sysupgrade')
+          ram = one(directory.glob('*elecom_wrc-x3200gst3-initramfs-kernel.bin'), 'initramfs')
+          with tempfile.TemporaryDirectory(prefix='verify-kexec-') as temp:
+              work = Path(temp)
+              with tarfile.open(sysup, 'r:') as archive:
+                  kernel = one((m for m in archive.getmembers() if m.isfile() and m.name.endswith('/kernel')), 'tar kernel')
+                  root = one((m for m in archive.getmembers() if m.isfile() and m.name.endswith('/root')), 'tar rootfs')
+                  need(0 < kernel.size <= 6 * 1024 * 1024, 'kernel exceeds original 6 MiB partition')
+                  # Local conservative policy, NOT the raw UBI capacity. Actual device
+                  # bad blocks and available LEBs still need checking before installation.
+                  need(0 < root.size <= 10 * 1024 * 1024, 'rootfs exceeds this bridge build 10 MiB safety budget')
+                  rootfile = work / 'root.squashfs'
+                  with archive.extractfile(root) as source, rootfile.open('wb') as dest:
+                      shutil.copyfileobj(source, dest)
+                  with rootfile.open('rb') as source:
+                      need(source.read(4) == b'hsqs', 'rootfs is not SquashFS')
+                  check_fit(archive.extractfile(kernel).read(), 'sysupgrade', work)
+                  print(f'OK: kernel={kernel.size} bytes; SquashFS={root.size} bytes')
+
+              check_fit(ram.read_bytes(), 'initramfs', work)
+              extracted = work / 'root'
+              subprocess.run(['unsquashfs', '-no-progress', '-d', str(extracted),
+                              str(rootfile), 'usr/sbin/kexec'], check=True)
+              binary = extracted / 'usr/sbin/kexec'
+              need(binary.is_file() and not binary.is_symlink(), 'kexec not found in final SquashFS')
+              data = binary.read_bytes()
+              need(len(data) >= 64 and data[:4] == b'\x7fELF' and data[4:6] == b'\x02\x01', 'kexec is not ELF64 little-endian')
+              need(struct.unpack_from('<H', data, 18)[0] == 183, 'kexec is not an AArch64 executable')
+              need(bool(binary.stat().st_mode & 0o111), 'kexec is not executable')
+              print('OK: final SquashFS contains executable AArch64 /usr/sbin/kexec')
+
+          # A built APK alone does not prove inclusion; the checks above do.
+          manifests = list(directory.glob('*.manifest'))
+          need(bool(manifests), 'package manifest missing')
+          matched = []
+          for manifest in manifests:
+              names = {line.split()[0] for line in manifest.read_text().splitlines() if line.strip()}
+              if 'kexec' in names:
+                  need(not any(re.match(r'^(python[0-9]*|libpython|micropython|pip(?:3)?$)', n) for n in names), 'unexpected Python in manifest')
+                  matched.append(manifest)
+                  shutil.copy2(manifest, out / manifest.name)
+          need(bool(matched), 'kexec missing from package manifest')
+          print('OK: package manifest contains kexec and no Python')
+
+          apks = [p for p in Path('bin/packages').rglob('*.apk') if re.match(r'^kexec-[0-9]', p.name)]
+          need(bool(apks), 'kexec APK missing')
+          (out / 'packages').mkdir(exist_ok=True)
+          for p in apks:
+              dest = out / 'packages' / p.name
+              need(not dest.exists() or dest.read_bytes() == p.read_bytes(), 'conflicting APK filenames')
+              shutil.copy2(p, dest)
+          for image in (sysup, ram):
+              shutil.copy2(image, out / image.name)
+          shutil.copy2('.config', out / 'full.config')
+          shutil.copy2('feeds.conf.default', out / 'feeds.conf.default')
+          print('All build checks passed. Device kexec reboot and migration are NOT yet tested.')
+
+          PY_VERIFY
+
+      - name: Collect provenance and checksums
+        run: |
+          set -euo pipefail
+          cd openwrt
+          ./scripts/diffconfig.sh > ../artifacts/build.config
+          git rev-parse HEAD > ../artifacts/source-commit.txt
+          git diff > ../artifacts/source-changes.patch
+          for feed in feeds/*; do
+            if [ -d "$feed/.git" ] || [ -f "$feed/.git" ]; then
+              printf '%s ' "${feed##*/}"
+              git -C "$feed" rev-parse HEAD
+            fi
+          done > ../artifacts/feed-commits.txt
+          cp ../diagnostics/verify.log ../artifacts/verification.txt
           cat > ../artifacts/READ-BEFORE-FLASH.txt <<'NOTICE'
-          ELECOM WRC-X3200GST3
-          OpenWrt 25.12.6
-          
-          BUILD OUTPUT ONLY.
-
-          Original default partition layout retained.
-          No DTS partition modifications.
-          No automatic flashing.
-          No automatic NAND erase.
-          No automatic UBI resize.
-
-          KEXEC kernel configuration enabled.
-          KEXEC userspace package requested.
-
-          Initramfs image is for RAM boot.
-          Initramfs image is NOT a sysupgrade image.
-
-          This firmware is NOT the 109 MiB migration firmware.
-          Do not use it to assume that partition migration is complete.
-
-          KEXEC availability does not prove that RAM boot
-          or no-serial migration is reliable on this device.
+          WRC-X3200GST3 / OpenWrt 25.12.6 / original 19 MiB UBI layout
+          This is a KEXEC BRIDGE build, NOT a 109 MiB migration image.
+          Both kernel KEXEC support and the AArch64 userspace binary were build-checked.
+          No Python runtime is selected for the router.
+          No automatic flashing, erasing, environment editing or kexec execution.
+          Do NOT use this default-layout image on an already expanded 109 MiB device.
+          Back up configuration and MTD data before any installation or RAM boot test.
+          A matching release number does not prove matching kernel-module ABI.
+          The standalone kexec APK does not add support to an existing kernel.
+          ARM64 kexec-tools does not treat the board's FIT .bin as a raw ARM64 Image.
+          A later RAM boot needs the correct Image, separate initrd when present,
+          and the destination LARGE-LAYOUT DTB, normally using legacy kexec_load (-c).
+          Do not reuse the current small-layout DTB for the large-layout target.
+          Build checks do not verify driver shutdown, watchdog handling, networking,
+          actual usable UBI blocks, successful kexec reboot, or safe no-serial recovery.
+          No full device migration has been performed by this workflow.
           NOTICE
-
           cd ../artifacts
-
-          sha256sum *.bin > SHA256SUMS
-
-          echo "===== Final artifacts ====="
+          find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS
           ls -lh
 
-      # 9. 上传固件
-      - name: Upload firmware
+      - name: Upload verified firmware only
         uses: actions/upload-artifact@v6
         with:
-          name: WRC-X3200GST3-25.12.6-KEXEC-default
+          name: WRC-X3200GST3-25.12.6-KEXEC-default-fixed
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
 
-      # 10. 即使失败也上传日志
-      - name: Upload build logs
+      - name: Upload diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: WRC-X3200GST3-build-logs
-          path: |
-            feeds-update.log
-            feeds-install.log
-            defconfig.log
-            download.log
-            build.log
+          name: WRC-X3200GST3-25.12.6-KEXEC-build-logs
+          path: diagnostics/
           if-no-files-found: warn
           retention-days: 30
